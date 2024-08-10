@@ -6,6 +6,7 @@ on:
       action:
         description: 'Action to perform (create or close)'
         required: true
+        type: choice
         default: 'create'
         options:
           - create
