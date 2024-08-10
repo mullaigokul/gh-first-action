@@ -1,0 +1,155 @@
+name: Manage Milestones
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform (create or close)'
+        required: true
+        default: 'create'
+        options:
+          - create
+          - close
+      title:
+        description: 'Milestone title (Aug 16, 2024)'
+        required: true
+      description:
+        description: 'Milestone description'
+        required: false
+      due_on:
+        description: 'Milestone due date (YYYY-MM-DD)'
+        required: false
+
+jobs:
+  manage-milestone:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate with GitHub CLI
+        shell: bash
+        run: |
+          unset GITHUB_TOKEN
+          echo "${{ secrets.PAT_TOKEN }}" > gh_token.txt
+          gh auth login --with-token < gh_token.txt
+
+      - name: Verify Authentication
+        shell: bash
+        run: |
+          gh auth status
+
+      - name: Convert Date Format
+        id: convert-date
+        shell: bash
+        run: |
+          if ! date -u -d "${{ github.event.inputs.due_on }}" +"%Y-%m-%dT%H:%M:%SZ" &> /dev/null; then
+            echo "Invalid date [ ${{ github.event.inputs.due_on }} ]. Expected format YYYY-MM-DD"
+            exit 1
+          fi
+
+          converted_date=$(date -u -d "${{ github.event.inputs.due_on }}" +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Date for milestone creation: [ $converted_date ]"
+
+          echo "converted_date=$converted_date" >> $GITHUB_OUTPUT
+
+      - name: Get Username
+        id: get-username
+        shell: bash
+        run: |
+          username=$(gh api user --jq '.login')
+          echo "username=$username" >> $GITHUB_OUTPUT
+          echo "User name: [ $username ]"
+
+      - name: Get Repositories
+        id: get-repos
+        shell: bash
+        run: |
+          {
+            echo 'repos<<EOF'
+            gh repo list ${{ steps.get-username.outputs.username }} --json nameWithOwner --jq '.[].nameWithOwner'
+            echo EOF
+          }>> "$GITHUB_OUTPUT"
+
+      - name: Build exclude repository list
+        id: build-exclude-repo-list
+        shell: bash
+        run: |
+          exclude_repos=("co-founders-task-tracking" ".github.private" "daas-poc" "daas-api-docs" "daas-docs" "poc-daas-app" "poc-daas-core")
+
+          # Convert the array to a comma-separated string
+          exclude_repos_str=$(IFS=,; echo "${exclude_repos[*]}")
+
+          # Append the string to the GitHub step output
+          echo "exclude_repos=$exclude_repos_str" >> $GITHUB_OUTPUT
+          echo "Repository list to be excluded: [ $exclude_repos_str ]"
+
+      - name: Log Repositories
+        shell: bash
+        run: |
+          echo "All repositories: [ ${{ steps.get-repos.outputs.repos }} ]"
+
+      - name: Manage Milestone
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        shell: bash
+        run: |
+          action="${{ github.event.inputs.action }}"
+          exclude_repos=${{ steps.build-exclude-repo-list.outputs.exclude_repos }}
+
+          # Convert exclude_repos to an array
+          IFS=',' read -r -a exclude_repos_array <<< "$exclude_repos"
+
+          # Filter out excluded repositories
+          filtered_repos=()
+
+          repos="${{ steps.get-repos.outputs.repos }}"
+
+          IFS=$'\n'
+          for repo in $repos; do
+            skip=false
+            for exclude_repo in "${exclude_repos_array[@]}"; do
+              if [[ $repo == *"$exclude_repo" ]]; then
+                echo "Excluding repo [ $repo ] from milestone management"
+                skip=true
+                break
+              fi
+            done
+
+            if [ "$skip" = false ]; then
+              filtered_repos+=("$repo")
+            fi
+          done
+
+          echo "Filtered repositories: [ ${filtered_repos[@]} ]"
+
+          for repo in ${filtered_repos[@]}; do
+            if [ "$action" == "create" ]; then
+              echo -e "\nCreating milestone in repo: [ $repo ] with title: [ ${{ github.event.inputs.title }} ]"
+              gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                /repos/$repo/milestones \
+                -f title="${{ github.event.inputs.title }}" \
+                -f description="${{ github.event.inputs.description }}" \
+                -f due_on="${{ steps.convert-date.outputs.converted_date }}"
+            elif [ "$action" == "close" ]; then
+              echo -e "\nClosing milestone in repo: [ $repo ] with title: [ ${{ github.event.inputs.title }} ]"
+              milestone_id=$(gh api "repos/$repo/milestones" --jq ".[] | select(.title==\"${{ github.event.inputs.title }}\") | .number")
+              if [ -n "$milestone_id" ]; then
+                gh api \
+                  --method PATCH \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  /repos/$repo/milestones/$milestone_id \
+                  -f state="closed"
+              else
+                echo "Milestone with title [ ${{ github.event.inputs.title }} ] not found in repo [ $repo ]"
+              fi
+            else
+              echo "Invalid action: [ $action ]. Expected 'create' or 'close'."
+              exit 1
+            fi
+          done
